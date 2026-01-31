@@ -118,9 +118,23 @@ def run_real_time_prediction(model):
             
             # Draw landmarks
             frame = draw_landmarks_on_frame(frame, hand, mp_hands)
-            
+
+            # Detect handedness (MediaPipe provides Left/Right) and extract features
+            handedness_label = None
+            try:
+                if result.multi_handedness:
+                    handedness_label = result.multi_handedness[0].classification[0].label
+            except Exception:
+                handedness_label = None
+
             # Extract normalized features
             features = extract_hand_landmarks(hand)
+
+            # If model was trained on right-hand only, mirror left-hand features so they match
+            # (flip the x-coordinates in the flattened [x,y,z,...] feature vector)
+            if handedness_label and handedness_label.lower().startswith("l"):
+                for i in range(0, len(features), 3):
+                    features[i] = -features[i]
             
             # Make prediction
             probs = model.predict_proba([features])[0]
