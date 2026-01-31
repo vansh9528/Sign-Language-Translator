@@ -10,23 +10,29 @@ Usage:
 import cv2
 import pickle
 import numpy as np
+import time
+from collections import deque, Counter
 from config import (
     MODEL_PATH,
     STABLE_FRAMES,
     CONFIDENCE_THRESHOLD,
     DISPLAY_ON_UNSTABLE,
     CAMERA_BACKEND,
+    USE_ESP32,
+    ESP32_STREAM_URL,
+    FLIP_FRAME,
     WINDOW_NAME,
     FONT_SCALE,
     FONT_COLOR,
     FONT_THICKNESS
 )
-from utils import (
+from utils_fixed import (
     initialize_hand_detector,
     initialize_camera,
     extract_hand_landmarks,
     draw_landmarks_on_frame,
-    add_text_to_frame
+    add_text_to_frame,
+    create_mjpeg_stream,
 )
 
 
@@ -53,9 +59,13 @@ def run_real_time_prediction(model):
     # Initialize detector and camera
     hands, mp_hands = initialize_hand_detector()
     cap = initialize_camera(CAMERA_BACKEND)
+    if USE_ESP32:
+        print(f"Using ESP32-CAM stream (URL from config)")
     
     last_prediction = ""
     stable_count = 0
+    # deque used for short-window majority smoothing to avoid sticky/incorrect labels
+    prediction_buffer = deque(maxlen=STABLE_FRAMES)
     
     print(f"\n{'='*50}")
     print("REAL-TIME GESTURE RECOGNITION")
@@ -63,12 +73,40 @@ def run_real_time_prediction(model):
     print("Show your hand to the camera")
     print("Press ESC to exit\n")
     
+    read_failures = 0
+    MAX_CONSECUTIVE_READ_FAILURES = 3
+
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
-        
-        frame = cv2.flip(frame, 1)
+            read_failures += 1
+            print(f"❌ Frame not received from capture (consecutive failures: {read_failures})")
+            # If using ESP32, try reconnection first; after a few failures switch to MJPEG fallback
+            if USE_ESP32:
+                if read_failures < MAX_CONSECUTIVE_READ_FAILURES:
+                    print("Attempting to reconnect to ESP32 stream...")
+                    try:
+                        cap = initialize_camera(CAMERA_BACKEND)
+                        continue
+                    except Exception as e:
+                        print(f"Reconnect failed: {e}")
+                        time.sleep(0.5)
+                        continue
+                else:
+                    print("Switching to MJPEG fallback after repeated read failures")
+                    try:
+                        cap = create_mjpeg_stream(ESP32_STREAM_URL)
+                        read_failures = 0
+                        print("MJPEG fallback active")
+                        continue
+                    except Exception as e:
+                        print(f"MJPEG fallback failed: {e}")
+                        break
+            else:
+                break
+
+        if FLIP_FRAME:
+            frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
         
@@ -88,23 +126,30 @@ def run_real_time_prediction(model):
             probs = model.predict_proba([features])[0]
             pred = model.classes_[np.argmax(probs)]
             confidence = np.max(probs)
-            
-            # Stability check
-            if pred == last_prediction:
-                stable_count += 1
-            else:
-                stable_count = 0
-            
-            # Display gesture if stable and confident
-            if stable_count >= STABLE_FRAMES and confidence > CONFIDENCE_THRESHOLD:
-                display_text = pred
-            
+
+            # Add to smoothing buffer and compute majority
+            prediction_buffer.append(pred)
+            most_common, count = Counter(prediction_buffer).most_common(1)[0]
+
+            # If the buffer is full (i.e. we have STABLE_FRAMES samples) and the majority
+            # agrees, and the classifier is confident, accept the gesture.
+            if len(prediction_buffer) == STABLE_FRAMES and count >= STABLE_FRAMES and confidence > CONFIDENCE_THRESHOLD:
+                display_text = most_common
+
+            # Update helpers for debugging / logging
             last_prediction = pred
+            stable_count = count
             confidence_text = f"Confidence: {confidence:.2f}"
-            
-            # Print debug info
-            print(f"{pred:15} | Confidence: {confidence:.2f} | Stable: {stable_count}/{STABLE_FRAMES}")
+
+            # Print compact debug info
+            print(f"pred={pred:10} | top={most_common:10}({count}/{STABLE_FRAMES}) | conf={confidence:.2f} | buffer={list(prediction_buffer)}")
         
+        else:
+            # No hand detected: clear smoothing buffer so previous gestures don't stick
+            prediction_buffer.clear()
+            stable_count = 0
+            last_prediction = ""
+
         # Draw text on frame
         frame = add_text_to_frame(
             frame,
